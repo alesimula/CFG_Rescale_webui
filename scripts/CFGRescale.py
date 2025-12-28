@@ -3,14 +3,20 @@ import torch
 import re
 import gradio as gr
 import numpy as np
+from tqdm import tqdm
+from functools import partial
 import modules.scripts as scripts
 import modules.images as saving
+import modules.sd_samplers_cfg_denoiser as denoiser_module
 from einops import rearrange, repeat
 from modules import devices, processing, shared, sd_samplers_kdiffusion, sd_samplers_compvis, script_callbacks
 from modules.processing import Processed
 from modules.shared import opts, state
 from PIL import Image
+import sys
+import modules.sd_samplers_cfg_denoiser
 
+cfg_denoiser_module = sys.modules['modules.sd_samplers_cfg_denoiser']
 re_prompt_cfgr = re.compile(r"<cfg_rescale:([^>]+)>")
 
 def noise_like(shape, device, repeat=False):
@@ -19,6 +25,26 @@ def noise_like(shape, device, repeat=False):
     )
     noise = lambda: torch.randn(shape, device=device)
     return repeat_noise() if repeat else noise()
+    
+def make_ddim_timesteps(ddim_discr_method, num_ddim_timesteps, num_ddpm_timesteps, verbose=True):
+    if ddim_discr_method == "uniform":
+        c = num_ddpm_timesteps // num_ddim_timesteps
+        ddim_timesteps = np.asarray(list(range(0, num_ddpm_timesteps, c)))
+    elif ddim_discr_method == "quad":
+        ddim_timesteps = (
+            (np.linspace(0, np.sqrt(num_ddpm_timesteps * 0.8), num_ddim_timesteps)) ** 2
+        ).astype(int)
+    else:
+        raise NotImplementedError(
+            f'There is no ddim discretization method called "{ddim_discr_method}"'
+        )
+
+    # assert ddim_timesteps.shape[0] == num_ddim_timesteps
+    # add one to get the final alpha values right (the ones from first scale to data during sampling)
+    steps_out = ddim_timesteps + 1
+    if verbose:
+        print(f"Selected timesteps for ddim sampler: {steps_out}")
+    return steps_out
 
 def make_ddim_sampling_parameters(alphacums, ddim_timesteps, eta, verbose=True):
     # select alphas for computing the variance schedule
@@ -44,6 +70,9 @@ class Script(scripts.Script):
 
     def __init__(self):
         self.old_denoising = sd_samplers_kdiffusion.CFGDenoiser.combine_denoised
+        self.old_forward = sd_samplers_kdiffusion.CFGDenoiser.forward
+        self.old_sampling_function = cfg_denoiser_module.sampling_function
+        self.old_cfg_after_cfg_callback = cfg_denoiser_module.cfg_after_cfg_callback
         globals()['enable_furry_cocks'] = True
 
         def find_module(module_names):
@@ -53,6 +82,24 @@ class Script(scripts.Script):
                 if data.script_class.__module__ in module_names and hasattr(data, "module"):
                     return data.module
             return None
+            
+        k_combine = self.cfg_replace
+        k_old_forward = self.old_forward
+        k_sampling_function = self.old_sampling_function
+        
+        def custom_sampling_function(self, denoiser_params, cond_scale, cond_composition, extra_model_options):
+            denoised, cond_pred, uncond_pred = k_sampling_function(self, denoiser_params, cond_scale, cond_composition, extra_model_options)
+            denoised = k_combine(denoised, 0.0075)
+            return denoised, cond_pred, uncond_pred
+        cfg_denoiser_module.sampling_function = custom_sampling_function
+        
+        
+        k_cfg_after_cfg_callback = self.old_cfg_after_cfg_callback
+        def custom_cfg_after_cfg_callback(after_cfg_callback_params):
+            k_cfg_after_cfg_callback(after_cfg_callback_params)
+            denoised = k_combine(after_cfg_callback_params.x, -0.1)
+            after_cfg_callback_params.x = denoised
+        cfg_denoiser_module.cfg_after_cfg_callback = custom_cfg_after_cfg_callback
 
         def rescale_opt(p, x, xs):
             globals()['cfg_rescale_fi'] = x
@@ -97,25 +144,17 @@ class Script(scripts.Script):
             self.paste_field_names.append(field_name)
         return [rescale, recolor, rec_strength, show_original]
 
-    def cfg_replace(self, x_out, conds_list, uncond, cond_scale):
-        denoised_uncond = x_out[-uncond.shape[0]:]
-        denoised = torch.clone(denoised_uncond)
+    def cfg_replace(self, x_out, factor):
         fi = globals()['cfg_rescale_fi']
+        
+        if fi == 0:
+            return x_out
+        for i, shape in enumerate(x_out):
+            x_out[i] = (1.0 + factor * fi) * shape
 
-        for i, conds in enumerate(conds_list):
-            for cond_index, weight in conds:
-                if fi == 0:
-                    denoised[i] += (x_out[cond_index] - denoised_uncond[i]) * (weight * cond_scale)
-                else:
-                    xcfg = (denoised_uncond[i] + (x_out[cond_index] - denoised_uncond[i]) * (cond_scale * weight))
-                    xrescaled = (torch.std(x_out[cond_index]) / torch.std(xcfg))
-                    xfinal = fi * xrescaled + (1.0 - fi)
-                    denoised[i] = xfinal * xcfg
-
-        return denoised
+        return x_out
 
     def process(self, p, rescale, recolor, rec_strength, show_original):
-
         if globals()['enable_furry_cocks']:
             # parse <cfg_rescale:[number]> from prompt for override
             rescale_override = None
@@ -136,8 +175,6 @@ class Script(scripts.Script):
             rescale = globals()['cfg_rescale_fi']
         globals()['enable_furry_cocks'] = True
 
-        sd_samplers_kdiffusion.CFGDenoiser.combine_denoised = self.cfg_replace
-
         if rescale > 0:
             p.extra_generation_params["CFG Rescale"] = rescale
 
@@ -157,7 +194,6 @@ class Script(scripts.Script):
 
     def postprocess(self, p, processed, rescale, recolor, rec_strength, show_original):
         sd_samplers_kdiffusion.CFGDenoiser.combine_denoised = self.old_denoising
-
         def postfix(img, rec_strength):
             prec = 0.0005 * rec_strength
             r, g, b = img.split()
