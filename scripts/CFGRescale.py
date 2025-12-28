@@ -1,10 +1,7 @@
 import math
 import torch
-import torch.nn as nn
-import tqdm
 import re
 import gradio as gr
-import k_diffusion.sampling as sampling
 import numpy as np
 import modules.scripts as scripts
 import modules.images as saving
@@ -41,48 +38,12 @@ def make_ddim_sampling_parameters(alphacums, ddim_timesteps, eta, verbose=True):
             f"this results in the following sigma_t schedule for ddim sampler {sigmas}"
         )
     return sigmas, alphas, alphas_prev
-	
-@torch.no_grad()
-def ddim(model, x, timesteps, extra_args=None, callback=None, disable=None, eta=0.0):
-    alphas_cumprod = model.inner_model.inner_model.alphas_cumprod
-    alphas = alphas_cumprod[timesteps]
-    alphas_prev = alphas_cumprod[torch.nn.functional.pad(timesteps[:-1], pad=(1, 0))].to(
-        torch.float64 if x.device.type != "mps" and x.device.type != "xpu" else torch.float32
-    )
-    sqrt_one_minus_alphas = torch.sqrt(1 - alphas)
-    sigmas = eta * np.sqrt(
-        (1 - alphas_prev.cpu().numpy()) / (1 - alphas.cpu()) * (1 - alphas.cpu() / alphas_prev.cpu().numpy())
-    )
 
-    extra_args = {} if extra_args is None else extra_args
-    s_in = x.new_ones((x.shape[0]))
-    s_x = x.new_ones((x.shape[0], 1, 1, 1))
-    for i in tqdm.trange(len(timesteps) - 1, disable=disable):
-        index = len(timesteps) - 1 - i
-
-        e_t = model(x, timesteps[index].item() * s_in, **extra_args)
-
-        a_t = alphas[index].item() * s_x
-        a_prev = alphas_prev[index].item() * s_x
-        sigma_t = sigmas[index].item() * s_x
-        sqrt_one_minus_at = sqrt_one_minus_alphas[index].item() * s_x
-
-        pred_x0 = (x - sqrt_one_minus_at * e_t) / a_t.sqrt()
-        dir_xt = (1.0 - a_prev - sigma_t**2).sqrt() * e_t
-        noise = sigma_t * sampling.torch.randn_like(x)
-        x = a_prev.sqrt() * pred_x0 + dir_xt + noise
-
-        if callback is not None:
-            callback({"x": x, "i": i, "sigma": 0, "sigma_hat": 0, "denoised": pred_x0})
-
-    return x
 
 class Script(scripts.Script):
 
     def __init__(self):
         self.old_denoising = sd_samplers_kdiffusion.CFGDenoiser.combine_denoised
-        self.old_schedule = ddim.DDIMSampler.make_schedule
-        self.old_sample = ddim.DDIMSampler.p_sample_ddim
         globals()['enable_furry_cocks'] = True
 
         def find_module(module_names):
@@ -285,4 +246,5 @@ def on_infotext_pasted(infotext, params):
 
 
 script_callbacks.on_infotext_pasted(on_infotext_pasted)
+
 
